@@ -1,0 +1,186 @@
+package audio
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"sync"
+
+	"github.com/gen2brain/malgo"
+)
+
+// DeviceInfo represents an audio playback device.
+type DeviceInfo struct {
+	ID        string
+	Name      string
+	IsDefault bool
+}
+
+// preloadedSound holds decoded WAV PCM data ready for playback.
+type preloadedSound struct {
+	pcmData       []byte
+	numChannels   uint16
+	bitsPerSample uint16
+	sampleRate    uint32
+}
+
+// AudioPlayerEngine manages the audio context lifecycle and caches preloaded sounds
+// and their Players for low-latency repeated playback.
+//
+// Typical usage:
+//
+//	engine.Init()
+//	defer engine.Destroy()
+//	engine.Preload("beep", "beep.wav")
+//	engine.PlaySound("beep", "") // play on default device
+type AudioPlayerEngine struct {
+	ctx    *malgo.AllocatedContext
+	sounds map[string]*preloadedSound // name → decoded PCM
+	cache  map[string]*Player         // "name|deviceID" → Player
+	players []*Player                 // all Players for cleanup
+	mu     sync.Mutex
+}
+
+// Init initializes the audio backend. Must be called first.
+func (e *AudioPlayerEngine) Init() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.ctx != nil {
+		return nil
+	}
+	ctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, func(message string) {
+		// discard malgo log output
+	})
+	if err != nil {
+		return err
+	}
+	e.ctx = ctx
+	e.sounds = make(map[string]*preloadedSound)
+	e.cache = make(map[string]*Player)
+	return nil
+}
+
+// Destroy stops and closes all Players, then releases the audio backend.
+func (e *AudioPlayerEngine) Destroy() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.ctx == nil {
+		return nil
+	}
+	for _, p := range e.players {
+		p.device.Stop()
+		p.device.Uninit()
+	}
+	e.players = nil
+	e.cache = nil
+	e.sounds = nil
+	e.ctx.Uninit()
+	e.ctx.Free()
+	e.ctx = nil
+	return nil
+}
+
+// ListDevices returns all available audio playback devices.
+func (e *AudioPlayerEngine) ListDevices() ([]DeviceInfo, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.ctx == nil {
+		return nil, ErrNotInitialized
+	}
+	return listDevicesWithCtx(e.ctx)
+}
+
+// Preload decodes a WAV file and caches the PCM data in memory under the given name.
+// Subsequent PlaySound calls use the cached data with no disk I/O.
+func (e *AudioPlayerEngine) Preload(name string, wavPath string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.ctx == nil {
+		return ErrNotInitialized
+	}
+	if _, ok := e.sounds[name]; ok {
+		return nil // already loaded
+	}
+	snd, err := loadSound(wavPath)
+	if err != nil {
+		return err
+	}
+	e.sounds[name] = snd
+	return nil
+}
+
+// PlaySound plays a preloaded sound on the given device.
+// If a Player for this (sound, device) combination exists, it reuses it (low latency).
+// Otherwise a new Player is created and cached for future calls.
+// Returns the Player so callers can wait on Done().
+// Pass deviceID="" for the default device.
+func (e *AudioPlayerEngine) PlaySound(name string, deviceID string) (*Player, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.ctx == nil {
+		return nil, ErrNotInitialized
+	}
+
+	snd, ok := e.sounds[name]
+	if !ok {
+		return nil, fmt.Errorf("未预加载的音效: %s", name)
+	}
+
+	key := name + "|" + deviceID
+	p, ok := e.cache[key]
+	if ok {
+		return p, p.Replay()
+	}
+
+	var err error
+	p, err = newPlayerFromSound(e.ctx, snd, deviceID)
+	if err != nil {
+		return nil, err
+	}
+	e.players = append(e.players, p)
+	e.cache[key] = p
+	return p, p.Play()
+}
+
+// --- internal ---
+
+func listDevicesWithCtx(ctx *malgo.AllocatedContext) ([]DeviceInfo, error) {
+	devices, err := ctx.Devices(malgo.Playback)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]DeviceInfo, len(devices))
+	for i, d := range devices {
+		result[i] = DeviceInfo{
+			ID:        d.ID.String(),
+			Name:      d.Name(),
+			IsDefault: d.IsDefault == 1,
+		}
+	}
+	return result, nil
+}
+
+func loadSound(wavPath string) (*preloadedSound, error) {
+	file, err := os.Open(wavPath)
+	if err != nil {
+		return nil, fmt.Errorf("打开WAV文件失败: %w", err)
+	}
+	defer file.Close()
+
+	header, err := parseWAVHeader(file)
+	if err != nil {
+		return nil, fmt.Errorf("解析WAV头失败: %w", err)
+	}
+
+	pcmData, err := io.ReadAll(io.LimitReader(file, int64(header.dataSize)))
+	if err != nil {
+		return nil, fmt.Errorf("读取PCM数据失败: %w", err)
+	}
+
+	return &preloadedSound{
+		pcmData:       pcmData,
+		numChannels:   header.numChannels,
+		bitsPerSample: header.bitsPerSample,
+		sampleRate:    header.sampleRate,
+	}, nil
+}

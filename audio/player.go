@@ -1,0 +1,307 @@
+package audio
+
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"sync"
+	"sync/atomic"
+
+	"github.com/gen2brain/malgo"
+)
+
+const (
+	riffChunkID    = "RIFF"
+	waveFormat     = "WAVE"
+	fmtChunkID     = "fmt "
+	dataChunkID    = "data"
+	pcmAudioFormat = 1
+)
+
+type wavHeader struct {
+	sampleRate    uint32
+	numChannels   uint16
+	bitsPerSample uint16
+	dataSize      uint32
+	dataOffset    int64
+}
+
+// Player plays a WAV sound through an audio output device.
+// Created via AudioPlayerEngine.PlaySound(). Can be replayed via Replay().
+type Player struct {
+	device *malgo.Device
+	ctx    *malgo.AllocatedContext
+
+	pcmData []byte
+	pos     int
+	gen     atomic.Int64 // incremented on Reset/Replay, prevents stale callbacks
+
+	done chan struct{}
+	mu   sync.Mutex
+}
+
+func newPlayerFromSound(ctx *malgo.AllocatedContext, snd *preloadedSound, deviceID string) (*Player, error) {
+	format, err := toMalgoFormat(snd.bitsPerSample)
+	if err != nil {
+		return nil, err
+	}
+
+	deviceConfig := malgo.DefaultDeviceConfig(malgo.Playback)
+	deviceConfig.Playback.Format = format
+	deviceConfig.Playback.Channels = uint32(snd.numChannels)
+	deviceConfig.SampleRate = snd.sampleRate
+
+	if deviceID != "" {
+		rawID, err := resolveDeviceID(ctx, deviceID)
+		if err != nil {
+			return nil, err
+		}
+		deviceConfig.Playback.DeviceID = rawID.Pointer()
+	}
+
+	p := &Player{
+		ctx:     ctx,
+		pcmData: snd.pcmData,
+		done:    make(chan struct{}),
+	}
+
+	callbacks := malgo.DeviceCallbacks{
+		Data: p.dataCallback,
+		Stop: p.stopCallback,
+	}
+
+	device, err := malgo.InitDevice(ctx.Context, deviceConfig, callbacks)
+	if err != nil {
+		return nil, fmt.Errorf("初始化播放设备失败: %w", err)
+	}
+	p.device = device
+
+	return p, nil
+}
+
+// Play starts playback from the current position. Non-blocking.
+func (p *Player) Play() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.device.Start()
+}
+
+// Stop pauses playback. The device stays initialized and can be restarted.
+func (p *Player) Stop() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.device.Stop()
+}
+
+// Reset rewinds to the beginning so the Player can be replayed.
+func (p *Player) Reset() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.gen.Add(1)
+	p.pos = 0
+	p.done = make(chan struct{})
+}
+
+// Replay stops, resets, and starts playback from the beginning.
+func (p *Player) Replay() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.device.IsStarted() {
+		if err := p.device.Stop(); err != nil {
+			return err
+		}
+	}
+	p.gen.Add(1)
+	p.pos = 0
+	p.done = make(chan struct{})
+	return p.device.Start()
+}
+
+// Done returns a channel that is closed when playback finishes naturally.
+func (p *Player) Done() <-chan struct{} {
+	return p.done
+}
+
+// DeviceFormat returns the negotiated playback format details.
+func (p *Player) DeviceFormat() (format malgo.FormatType, channels uint32, sampleRate uint32) {
+	return p.device.PlaybackInternalFormat(),
+		p.device.PlaybackInternalChannels(),
+		p.device.PlaybackInternalSampleRate()
+}
+
+// --- internal ---
+
+func (p *Player) dataCallback(pOutput, _ []byte, frameCount uint32) {
+	gen := p.gen.Load()
+	if p.pos >= len(p.pcmData) {
+		for i := range pOutput {
+			pOutput[i] = 0
+		}
+		if p.gen.Load() == gen {
+			select {
+			case <-p.done:
+			default:
+				close(p.done)
+			}
+		}
+		return
+	}
+
+	n := copy(pOutput, p.pcmData[p.pos:])
+	p.pos += n
+
+	for i := n; i < len(pOutput); i++ {
+		pOutput[i] = 0
+	}
+	if p.pos >= len(p.pcmData) {
+		if p.gen.Load() == gen {
+			select {
+			case <-p.done:
+			default:
+				close(p.done)
+			}
+		}
+	}
+}
+
+func (p *Player) stopCallback() {
+	select {
+	case <-p.done:
+	default:
+		close(p.done)
+	}
+}
+
+func parseWAVHeader(r io.ReadSeeker) (*wavHeader, error) {
+	var riff [4]byte
+	if _, err := io.ReadFull(r, riff[:]); err != nil {
+		return nil, errors.New("无法读取RIFF标识")
+	}
+	if string(riff[:]) != riffChunkID {
+		return nil, errors.New("不是有效的RIFF文件")
+	}
+
+	r.Seek(4, io.SeekCurrent) // skip file size
+
+	var wave [4]byte
+	if _, err := io.ReadFull(r, wave[:]); err != nil {
+		return nil, errors.New("无法读取WAVE标识")
+	}
+	if string(wave[:]) != waveFormat {
+		return nil, errors.New("不是WAV文件")
+	}
+
+	var hdr wavHeader
+	foundFmt := false
+
+	for {
+		var chunkID [4]byte
+		_, err := io.ReadFull(r, chunkID[:])
+		if err != nil {
+			break
+		}
+
+		var chunkSize uint32
+		if err := binary.Read(r, binary.LittleEndian, &chunkSize); err != nil {
+			return nil, fmt.Errorf("读取chunk大小失败: %w", err)
+		}
+
+		switch string(chunkID[:]) {
+		case fmtChunkID:
+			if err := readFmtChunk(r, chunkSize, &hdr); err != nil {
+				return nil, err
+			}
+			foundFmt = true
+
+		case dataChunkID:
+			if !foundFmt {
+				return nil, errors.New("data chunk出现在fmt chunk之前")
+			}
+			hdr.dataSize = chunkSize
+			offset, _ := r.Seek(0, io.SeekCurrent)
+			hdr.dataOffset = offset
+			return &hdr, nil
+
+		default:
+			r.Seek(int64(chunkSize), io.SeekCurrent)
+		}
+	}
+
+	return nil, errors.New("未找到fmt或data chunk")
+}
+
+func readFmtChunk(r io.Reader, chunkSize uint32, hdr *wavHeader) error {
+	if chunkSize < 16 {
+		return errors.New("fmt chunk太小")
+	}
+
+	var audioFormat uint16
+	var byteRate, blockAlign uint32
+	var extraSize uint16
+
+	if err := binary.Read(r, binary.LittleEndian, &audioFormat); err != nil {
+		return err
+	}
+	if audioFormat != pcmAudioFormat {
+		return fmt.Errorf("不支持的音频格式: %d (仅支持PCM)", audioFormat)
+	}
+	if err := binary.Read(r, binary.LittleEndian, &hdr.numChannels); err != nil {
+		return err
+	}
+	if err := binary.Read(r, binary.LittleEndian, &hdr.sampleRate); err != nil {
+		return err
+	}
+	if err := binary.Read(r, binary.LittleEndian, &byteRate); err != nil {
+		return err
+	}
+	if err := binary.Read(r, binary.LittleEndian, &blockAlign); err != nil {
+		return err
+	}
+	if err := binary.Read(r, binary.LittleEndian, &hdr.bitsPerSample); err != nil {
+		return err
+	}
+
+	if chunkSize > 16 {
+		extraBytes := chunkSize - 16
+		if chunkSize >= 18 {
+			if err := binary.Read(r, binary.LittleEndian, &extraSize); err != nil {
+				return err
+			}
+			extraBytes -= 2
+		}
+		discard := make([]byte, extraBytes)
+		if _, err := io.ReadFull(r, discard); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func toMalgoFormat(bitsPerSample uint16) (malgo.FormatType, error) {
+	switch bitsPerSample {
+	case 8:
+		return malgo.FormatU8, nil
+	case 16:
+		return malgo.FormatS16, nil
+	case 24:
+		return malgo.FormatS24, nil
+	case 32:
+		return malgo.FormatS32, nil
+	default:
+		return malgo.FormatUnknown, fmt.Errorf("不支持的位深度: %d", bitsPerSample)
+	}
+}
+
+func resolveDeviceID(ctx *malgo.AllocatedContext, hexID string) (malgo.DeviceID, error) {
+	devices, err := ctx.Devices(malgo.Playback)
+	if err != nil {
+		return malgo.DeviceID{}, err
+	}
+	for _, d := range devices {
+		if d.ID.String() == hexID {
+			return d.ID, nil
+		}
+	}
+	return malgo.DeviceID{}, fmt.Errorf("未找到设备ID: %s", hexID)
+}
