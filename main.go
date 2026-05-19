@@ -102,6 +102,7 @@ func playFile(engine *audio.AudioPlayerEngine, wavPath, deviceID string, gain fl
 	}
 
 	fmt.Println("正在播放,按 Ctrl+C 停止...")
+	fmt.Printf("音量: %.2f, 增益: %.2f\n", engine.MasterVolume(), engine.MasterGain())
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt)

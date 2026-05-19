@@ -34,9 +34,10 @@ type Player struct {
 	device *malgo.Device
 	ctx    *malgo.AllocatedContext
 
-	pcmData []byte
-	pos     int
-	gen     atomic.Int64 // incremented on Reset/Replay, prevents stale callbacks
+	pcmData        []byte
+	pos            int
+	gen            atomic.Int64 // incremented on Reset/Replay, prevents stale callbacks
+	bytesPerSample int          // 1, 2, 3, or 4
 
 	volume atomic.Uint32 // float32 bits, 1.0 = full volume
 	gain   atomic.Uint32 // float32 bits, 1.0 = unity gain, >1.0 amplifies
@@ -64,9 +65,10 @@ func newPlayerFromSound(ctx *malgo.AllocatedContext, snd *preloadedSound, device
 	}
 
 	p := &Player{
-		ctx:     ctx,
-		pcmData: snd.pcmData,
-		done:    make(chan struct{}),
+		ctx:            ctx,
+		pcmData:        snd.pcmData,
+		done:           make(chan struct{}),
+		bytesPerSample: int(snd.bitsPerSample / 8),
 	}
 	p.volume.Store(math.Float32bits(1.0))
 	p.gain.Store(math.Float32bits(1.0))
@@ -193,15 +195,58 @@ func (p *Player) dataCallback(pOutput, _ []byte, frameCount uint32) {
 	gn := math.Float32frombits(p.gain.Load())
 	effective := float64(vol) * float64(gn)
 	if effective != 1.0 {
-		for i := 0; i+1 < n; i += 2 {
-			sample := int16(binary.LittleEndian.Uint16(pOutput[i : i+2]))
-			scaled := int32(float64(sample) * effective)
-			if scaled > 32767 {
-				scaled = 32767
-			} else if scaled < -32768 {
-				scaled = -32768
+		switch p.bytesPerSample {
+		case 1: // u8: unsigned 8-bit, center=128
+			for i := 0; i < n; i++ {
+				centered := int32(pOutput[i]) - 128
+				scaled := int32(float64(centered) * effective)
+				if scaled > 127 {
+					scaled = 127
+				} else if scaled < -128 {
+					scaled = -128
+				}
+				pOutput[i] = uint8(scaled + 128)
 			}
-			binary.LittleEndian.PutUint16(pOutput[i:i+2], uint16(scaled))
+		case 2: // s16: signed 16-bit little-endian
+			for i := 0; i+1 < n; i += 2 {
+				sample := int16(binary.LittleEndian.Uint16(pOutput[i : i+2]))
+				scaled := int32(float64(sample) * effective)
+				if scaled > 32767 {
+					scaled = 32767
+				} else if scaled < -32768 {
+					scaled = -32768
+				}
+				binary.LittleEndian.PutUint16(pOutput[i:i+2], uint16(scaled))
+			}
+		case 3: // s24: signed 24-bit little-endian
+			for i := 0; i+2 < n; i += 3 {
+				raw := uint32(pOutput[i]) | uint32(pOutput[i+1])<<8 | uint32(pOutput[i+2])<<16
+				if raw&0x800000 != 0 {
+					raw |= 0xFF000000
+				}
+				sample := int32(raw)
+				scaled := int64(float64(sample) * effective)
+				if scaled > 8388607 {
+					scaled = 8388607
+				} else if scaled < -8388608 {
+					scaled = -8388608
+				}
+				v := uint32(scaled)
+				pOutput[i] = byte(v)
+				pOutput[i+1] = byte(v >> 8)
+				pOutput[i+2] = byte(v >> 16)
+			}
+		case 4: // s32: signed 32-bit little-endian
+			for i := 0; i+3 < n; i += 4 {
+				sample := int32(binary.LittleEndian.Uint32(pOutput[i : i+4]))
+				scaled := int64(float64(sample) * effective)
+				if scaled > 2147483647 {
+					scaled = 2147483647
+				} else if scaled < -2147483648 {
+					scaled = -2147483648
+				}
+				binary.LittleEndian.PutUint32(pOutput[i:i+4], uint32(scaled))
+			}
 		}
 	}
 
