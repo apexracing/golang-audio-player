@@ -39,6 +39,7 @@ type Player struct {
 	gen     atomic.Int64 // incremented on Reset/Replay, prevents stale callbacks
 
 	volume atomic.Uint32 // float32 bits, 1.0 = full volume
+	gain   atomic.Uint32 // float32 bits, 1.0 = unity gain, >1.0 amplifies
 	done   chan struct{}
 	mu     sync.Mutex
 }
@@ -68,6 +69,7 @@ func newPlayerFromSound(ctx *malgo.AllocatedContext, snd *preloadedSound, device
 		done:    make(chan struct{}),
 	}
 	p.volume.Store(math.Float32bits(1.0))
+	p.gain.Store(math.Float32bits(1.0))
 
 	callbacks := malgo.DeviceCallbacks{
 		Data: p.dataCallback,
@@ -149,6 +151,23 @@ func (p *Player) Volume() float64 {
 	return float64(math.Float32frombits(p.volume.Load()))
 }
 
+// SetGain sets the gain factor. 1.0 = unity, >1.0 amplifies.
+// Clamped to [0, 5.0].
+func (p *Player) SetGain(factor float64) {
+	if factor < 0 {
+		factor = 0
+	}
+	if factor > 5.0 {
+		factor = 5.0
+	}
+	p.gain.Store(math.Float32bits(float32(factor)))
+}
+
+// Gain returns the current gain factor.
+func (p *Player) Gain() float64 {
+	return float64(math.Float32frombits(p.gain.Load()))
+}
+
 // --- internal ---
 
 func (p *Player) dataCallback(pOutput, _ []byte, frameCount uint32) {
@@ -171,10 +190,17 @@ func (p *Player) dataCallback(pOutput, _ []byte, frameCount uint32) {
 	p.pos += n
 
 	vol := math.Float32frombits(p.volume.Load())
-	if vol != 1.0 {
+	gn := math.Float32frombits(p.gain.Load())
+	effective := float64(vol) * float64(gn)
+	if effective != 1.0 {
 		for i := 0; i+1 < n; i += 2 {
 			sample := int16(binary.LittleEndian.Uint16(pOutput[i : i+2]))
-			scaled := int16(float64(sample) * float64(vol))
+			scaled := int32(float64(sample) * effective)
+			if scaled > 32767 {
+				scaled = 32767
+			} else if scaled < -32768 {
+				scaled = -32768
+			}
 			binary.LittleEndian.PutUint16(pOutput[i:i+2], uint16(scaled))
 		}
 	}

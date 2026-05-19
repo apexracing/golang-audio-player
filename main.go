@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
 
 	"github.com/apexracing/golang-audio-player/audio"
 )
@@ -26,19 +27,40 @@ func main() {
 		listDevices(&engine)
 	case "play":
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "用法: go run main.go play <wav文件> [设备ID]")
+			fmt.Fprintln(os.Stderr, "用法: go run main.go play <wav文件> [--gain <值>] [--device <设备ID>]")
 			os.Exit(1)
 		}
-		deviceID := ""
-		if len(os.Args) > 3 {
-			deviceID = os.Args[3]
-		}
-		playFile(&engine, os.Args[2], deviceID)
+		wavPath, deviceID, gain := parsePlayArgs(os.Args[2:])
+		playFile(&engine, wavPath, deviceID, gain)
 	default:
 		fmt.Fprintf(os.Stderr, "未知命令: %s\n", os.Args[1])
 		fmt.Fprintln(os.Stderr, "可用命令: list, play")
 		os.Exit(1)
 	}
+}
+
+func parsePlayArgs(args []string) (wavPath, deviceID string, gain float64) {
+	wavPath = args[0]
+	deviceID = ""
+	gain = 0 // 0 means use default (master gain, typically 1.0)
+
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "--device":
+			if i+1 < len(args) {
+				deviceID = args[i+1]
+				i++
+			}
+		case "--gain":
+			if i+1 < len(args) {
+				if v, err := strconv.ParseFloat(args[i+1], 64); err == nil {
+					gain = v
+				}
+				i++
+			}
+		}
+	}
+	return
 }
 
 func listDevices(engine *audio.AudioPlayerEngine) {
@@ -61,11 +83,16 @@ func listDevices(engine *audio.AudioPlayerEngine) {
 	}
 }
 
-func playFile(engine *audio.AudioPlayerEngine, wavPath, deviceID string) {
+func playFile(engine *audio.AudioPlayerEngine, wavPath, deviceID string, gain float64) {
 	name := wavPath
 	if err := engine.Preload(name, wavPath); err != nil {
 		fmt.Fprintf(os.Stderr, "预加载失败: %v\n", err)
 		os.Exit(1)
+	}
+
+	if gain > 0 {
+		engine.SetMasterGain(gain)
+		fmt.Printf("增益已设置为: %.2f\n", gain)
 	}
 
 	player, err := engine.PlaySound(name, deviceID)

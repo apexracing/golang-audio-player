@@ -42,6 +42,7 @@ type AudioPlayerEngine struct {
 	players []*Player                  // all Players for cleanup
 
 	masterVolume atomic.Uint32 // float32 bits, 1.0 = full volume
+	masterGain   atomic.Uint32 // float32 bits, 1.0 = unity gain
 	mu           sync.Mutex
 }
 
@@ -62,6 +63,7 @@ func (e *AudioPlayerEngine) Init() error {
 	e.sounds = make(map[string]*preloadedSound)
 	e.cache = make(map[string]*Player)
 	e.masterVolume.Store(math.Float32bits(1.0))
+	e.masterGain.Store(math.Float32bits(1.0))
 	return nil
 }
 
@@ -144,6 +146,8 @@ func (e *AudioPlayerEngine) PlaySound(name string, deviceID string) (*Player, er
 	}
 	mv := math.Float32frombits(e.masterVolume.Load())
 	p.SetVolume(float64(mv))
+	mg := math.Float32frombits(e.masterGain.Load())
+	p.SetGain(float64(mg))
 	e.players = append(e.players, p)
 	e.cache[key] = p
 	return p, p.Play()
@@ -169,6 +173,28 @@ func (e *AudioPlayerEngine) SetMasterVolume(factor float64) {
 // MasterVolume returns the current master volume factor.
 func (e *AudioPlayerEngine) MasterVolume() float64 {
 	return float64(math.Float32frombits(e.masterVolume.Load()))
+}
+
+// SetMasterGain sets the gain for all current and future Players.
+// factor 1.0 = unity, >1.0 amplifies. Clamped to [0, 5.0].
+func (e *AudioPlayerEngine) SetMasterGain(factor float64) {
+	if factor < 0 {
+		factor = 0
+	}
+	if factor > 5.0 {
+		factor = 5.0
+	}
+	e.masterGain.Store(math.Float32bits(float32(factor)))
+	e.mu.Lock()
+	for _, p := range e.cache {
+		p.SetGain(factor)
+	}
+	e.mu.Unlock()
+}
+
+// MasterGain returns the current master gain factor.
+func (e *AudioPlayerEngine) MasterGain() float64 {
+	return float64(math.Float32frombits(e.masterGain.Load()))
 }
 
 // --- internal ---
