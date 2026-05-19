@@ -237,7 +237,8 @@ func readFmtChunk(r io.Reader, chunkSize uint32, hdr *wavHeader) error {
 	}
 
 	var audioFormat uint16
-	var byteRate, blockAlign uint32
+	var byteRate uint32
+	var blockAlign uint16
 	var extraSize uint16
 
 	if err := binary.Read(r, binary.LittleEndian, &audioFormat); err != nil {

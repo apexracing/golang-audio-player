@@ -5,7 +5,11 @@
       "WebSearch",
       "Bash(go build *)",
       "Bash(go vet *)",
-      "Bash(go run *)"
+      "Bash(go run *)",
+      "Bash(xxd *)",
+      "Bash(go test *)",
+      "Bash(rm \"D:\\\\github\\\\golang-audio-player\\\\debug_wav.go\")",
+      "Bash(rm \"D:\\\\github\\\\golang-audio-player\\\\audio\\\\player_test.go\")"
     ]
   }
 }
