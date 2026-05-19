@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"sync"
 	"sync/atomic"
 
@@ -37,8 +38,9 @@ type Player struct {
 	pos     int
 	gen     atomic.Int64 // incremented on Reset/Replay, prevents stale callbacks
 
-	done chan struct{}
-	mu   sync.Mutex
+	volume atomic.Uint32 // float32 bits, 1.0 = full volume
+	done   chan struct{}
+	mu     sync.Mutex
 }
 
 func newPlayerFromSound(ctx *malgo.AllocatedContext, snd *preloadedSound, deviceID string) (*Player, error) {
@@ -65,6 +67,7 @@ func newPlayerFromSound(ctx *malgo.AllocatedContext, snd *preloadedSound, device
 		pcmData: snd.pcmData,
 		done:    make(chan struct{}),
 	}
+	p.volume.Store(math.Float32bits(1.0))
 
 	callbacks := malgo.DeviceCallbacks{
 		Data: p.dataCallback,
@@ -130,6 +133,22 @@ func (p *Player) DeviceFormat() (format malgo.FormatType, channels uint32, sampl
 		p.device.PlaybackInternalSampleRate()
 }
 
+// SetVolume sets the playback volume factor (0.0 = silent, 1.0 = full).
+func (p *Player) SetVolume(factor float64) {
+	if factor < 0 {
+		factor = 0
+	}
+	if factor > 1.0 {
+		factor = 1.0
+	}
+	p.volume.Store(math.Float32bits(float32(factor)))
+}
+
+// Volume returns the current playback volume factor.
+func (p *Player) Volume() float64 {
+	return float64(math.Float32frombits(p.volume.Load()))
+}
+
 // --- internal ---
 
 func (p *Player) dataCallback(pOutput, _ []byte, frameCount uint32) {
@@ -150,6 +169,15 @@ func (p *Player) dataCallback(pOutput, _ []byte, frameCount uint32) {
 
 	n := copy(pOutput, p.pcmData[p.pos:])
 	p.pos += n
+
+	vol := math.Float32frombits(p.volume.Load())
+	if vol != 1.0 {
+		for i := 0; i+1 < n; i += 2 {
+			sample := int16(binary.LittleEndian.Uint16(pOutput[i : i+2]))
+			scaled := int16(float64(sample) * float64(vol))
+			binary.LittleEndian.PutUint16(pOutput[i:i+2], uint16(scaled))
+		}
+	}
 
 	for i := n; i < len(pOutput); i++ {
 		pOutput[i] = 0

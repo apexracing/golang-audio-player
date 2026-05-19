@@ -3,8 +3,10 @@ package audio
 import (
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"sync"
+	"sync/atomic"
 
 	"github.com/gen2brain/malgo"
 )
@@ -34,11 +36,13 @@ type preloadedSound struct {
 //	engine.Preload("beep", "beep.wav")
 //	engine.PlaySound("beep", "") // play on default device
 type AudioPlayerEngine struct {
-	ctx    *malgo.AllocatedContext
-	sounds map[string]*preloadedSound // name → decoded PCM
-	cache  map[string]*Player         // "name|deviceID" → Player
-	players []*Player                 // all Players for cleanup
-	mu     sync.Mutex
+	ctx     *malgo.AllocatedContext
+	sounds  map[string]*preloadedSound // name → decoded PCM
+	cache   map[string]*Player         // "name|deviceID" → Player
+	players []*Player                  // all Players for cleanup
+
+	masterVolume atomic.Uint32 // float32 bits, 1.0 = full volume
+	mu           sync.Mutex
 }
 
 // Init initializes the audio backend. Must be called first.
@@ -57,6 +61,7 @@ func (e *AudioPlayerEngine) Init() error {
 	e.ctx = ctx
 	e.sounds = make(map[string]*preloadedSound)
 	e.cache = make(map[string]*Player)
+	e.masterVolume.Store(math.Float32bits(1.0))
 	return nil
 }
 
@@ -137,9 +142,33 @@ func (e *AudioPlayerEngine) PlaySound(name string, deviceID string) (*Player, er
 	if err != nil {
 		return nil, err
 	}
+	mv := math.Float32frombits(e.masterVolume.Load())
+	p.SetVolume(float64(mv))
 	e.players = append(e.players, p)
 	e.cache[key] = p
 	return p, p.Play()
+}
+
+// SetMasterVolume sets the volume for all current and future Players.
+// factor 0.0 = silent, 1.0 = full volume.
+func (e *AudioPlayerEngine) SetMasterVolume(factor float64) {
+	if factor < 0 {
+		factor = 0
+	}
+	if factor > 1.0 {
+		factor = 1.0
+	}
+	e.masterVolume.Store(math.Float32bits(float32(factor)))
+	e.mu.Lock()
+	for _, p := range e.cache {
+		p.SetVolume(factor)
+	}
+	e.mu.Unlock()
+}
+
+// MasterVolume returns the current master volume factor.
+func (e *AudioPlayerEngine) MasterVolume() float64 {
+	return float64(math.Float32frombits(e.masterVolume.Load()))
 }
 
 // --- internal ---
